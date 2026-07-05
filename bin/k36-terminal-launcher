@@ -183,31 +183,46 @@ def read_keyboard(fd):
     return None
 
 
-def clear_line(text=""):
-    return text[:WIDTH] + "\033[K"
+def screen_size(out):
+    try:
+        size = os.get_terminal_size(out)
+        return max(1, size.lines), max(20, size.columns)
+    except OSError:
+        return 24, 80
+
+
+def visible_rows(out):
+    screen_rows, _ = screen_size(out)
+    return max(1, min(ROWS, screen_rows - 5))
 
 
 def draw(out, items, selected, top, message=""):
+    screen_rows, screen_cols = screen_size(out)
+    list_rows = visible_rows(out)
+    content_width = max(20, min(WIDTH, screen_cols - 1))
     total_games = len([x for x in items if x["kind"] == "game"])
     lines = [
-        HOME + HIDE + GREEN + "K36:/games" + RESET + DIM + "  %s installed" % total_games + RESET,
+        GREEN + "K36:/games" + RESET + DIM + "  %s installed" % total_games + RESET,
         DIM + "-" * 54 + RESET,
     ]
-    for idx in range(top, min(len(items), top + ROWS)):
+    for idx in range(top, min(len(items), top + list_rows)):
         item = items[idx]
         marker = ">" if idx == selected else " "
         text = "%s [%s] %s" % (marker, item["label"], item["name"])
-        text = text[:60]
+        text = text[:content_width]
         if idx == selected:
-            lines.append(GREEN + INV + text.ljust(60) + RESET)
+            lines.append(GREEN + INV + text.ljust(content_width) + RESET)
         else:
             lines.append(GREEN + text + RESET)
-    while len(lines) < ROWS + 2:
+    while len(lines) < list_rows + 2:
         lines.append("")
     lines.append(DIM + "-" * 54 + RESET)
     lines.append(DIM + "dpad: scroll/hold   A: launch   select: back" + RESET)
-    lines.append(GREEN + message[:60] + RESET if message else "")
-    os.write(out, ("\n".join(clear_line(line) for line in lines) + "\n").encode())
+    lines.append(GREEN + message[:content_width] + RESET if message else "")
+    while len(lines) < screen_rows:
+        lines.append("")
+    frame = HIDE + "".join("\033[%s;1H%s\033[K" % (row, line) for row, line in enumerate(lines[:screen_rows], 1))
+    os.write(out, frame.encode())
 
 
 def launch(item, out):
@@ -223,11 +238,11 @@ def launch(item, out):
     subprocess.call(launch_command(item), shell=True, executable="/bin/bash")
 
 
-def update_window(selected, top):
+def update_window(selected, top, list_rows):
     if selected < top:
         return selected
-    if selected >= top + ROWS:
-        return selected - ROWS + 1
+    if selected >= top + list_rows:
+        return selected - list_rows + 1
     return top
 
 
@@ -268,7 +283,8 @@ def main():
         while True:
             if selected >= len(items):
                 selected = max(0, len(items) - 1)
-            top = update_window(selected, top)
+            list_rows = visible_rows(fd)
+            top = update_window(selected, top, list_rows)
             if dirty:
                 draw(fd, items, selected, top, message)
                 dirty = False
