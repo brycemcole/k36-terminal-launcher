@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+import glob
+import os
+import select
+import shlex
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import time
+import xml.etree.ElementTree as ET
+
+ROMS = os.environ.get("K36_ROMS_ROOT", "/roms")
+TTY = "/dev/tty1"
+GREEN = "\033[38;5;46m"
+DIM = "\033[38;5;34m"
+INV = "\033[7m"
+RESET = "\033[0m"
+CLEAR = "\033[2J\033[H"
+HOME = "\033[H"
+HIDE = "\033[?25l"
+SHOW = "\033[?25h"
+WIDTH = 66
+ROWS = 17
+
+
+def run_silent(cmd):
+    subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def mount_roms():
+    run_silent("sudo chmod 666 /dev/tty1 /dev/input/event* /dev/uinput")
+    run_silent("sudo /bin/plymouth hide-splash")
+    run_silent("sudo setfont /usr/share/consolefonts/Lat7-Terminus20x10.psf.gz")
+    if os.path.ismount(ROMS):
+        return
+    if os.path.exists("/dev/mmcblk2"):
+        part = subprocess.getoutput("blkid | awk -F: '/LABEL=\"EASYROMS\"/{print $1; exit}'")
+        if part:
+            run_silent("sudo umount /roms")
+            run_silent("sudo mount %s /roms" % shlex.quote(part))
+    elif os.path.exists("/dev/mmcblk1p3"):
+        run_silent("sudo mount /dev/mmcblk1p3 /roms")
+
+
+def clean_name(path):
+    name = os.path.basename(path)
+    lower = name.lower()
+    for suffix in [".p8.png", ".gba", ".nds", ".zip", ".7z", ".p8", ".sh"]:
+        if lower.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    for token in [" (USA, Europe)", " (USA, Australia)", " (USA)", " (Europe)", " (Rev 1)", " (Rev 2)", " (Rev 5)", " (NDSi Enhanced)"]:
+        name = name.replace(token, "")
+    name = name.replace("StardewValleyMainline", "Stardew Valley")
+    return name.replace("_", " ").strip()
+
+
+def gamelist_names(folder):
+    out = {}
+    p = os.path.join(ROMS, folder, "gamelist.xml")
+    try:
+        root = ET.parse(p).getroot()
+    except Exception:
+        return out
+    for game in root.findall("game"):
+        path = game.findtext("path")
+        name = game.findtext("name")
+        if path and name:
+            full = os.path.normpath(os.path.join(ROMS, folder, path))
+            out[full] = name.strip()
+    return out
+
+
+def add_games(games, system, label, folder, patterns, gamelist_folder=None):
+    names = gamelist_names(gamelist_folder or folder)
+    seen = set()
+    for pattern in patterns:
+        for path in glob.glob(os.path.join(ROMS, folder, pattern)):
+            if os.path.isfile(path):
+                seen.add(os.path.normpath(path))
+    for path in sorted(seen, key=lambda x: clean_name(x).lower()):
+        games.append({"system": system, "label": label, "path": path, "name": names.get(path, clean_name(path)), "kind": "game"})
+
+
+def scan_games():
+    games = []
+    add_games(games, "gba", "GBA", "gba", ["*.gba", "*.GBA", "*.zip", "*.ZIP", "*.7z", "*.7Z"])
+    add_games(games, "nds", "NDS", "nds", ["*.nds", "*.NDS", "*.zip", "*.ZIP", "*.7z", "*.7Z"])
+    add_games(games, "pico8", "PICO-8", "pico-8/carts", ["*.p8", "*.P8", "*.p8.png", "*.png", "*.PNG"], "pico-8")
+    add_games(games, "ports", "PORT", "ports", ["*.sh", "*.SH"])
+    games = [g for g in games if "_hidden-clutter" not in g["path"]]
+    games.append({"kind": "action", "label": "SYS", "name": "Stock EmulationStation", "action": "stock"})
+    games.append({"kind": "action", "label": "SYS", "name": "Reboot", "action": "reboot"})
+    games.append({"kind": "action", "label": "SYS", "name": "Power Off", "action": "poweroff"})
+    return games
+
+
+def core_path(*names):
+    for name in names:
+        path = "/home/ark/.config/retroarch/cores/%s_libretro.so" % name
+        if os.path.exists(path):
+            return path
+    return "/home/ark/.config/retroarch/cores/%s_libretro.so" % names[0]
+
+
+def launch_command(item):
+    rom = shlex.quote(item["path"])
+    if item["system"] == "gba":
+        core = core_path("mgba_rumble", "mgba", "gpsp")
+        return "sudo perfmax performance %s; nice -n -19 /usr/local/bin/retroarch -L %s %s; sudo perfnorm" % (rom, shlex.quote(core), rom)
+    if item["system"] == "nds":
+        return "sudo perfmax performance %s; nice -n -19 /usr/local/bin/drastic.sh %s; sudo perfnorm" % (rom, rom)
+    if item["system"] == "pico8":
+        return "sudo perfmax performance %s; sudo systemctl start pico8hotkey; nice -n -19 /usr/local/bin/pico8.sh fake08 %s; sudo systemctl stop pico8hotkey; sudo perfnorm" % (rom, rom)
+    if item["system"] == "ports":
+        return "sudo perfmax performance %s; nice -n -19 /usr/local/bin/AltSDL.sh %s; sudo perfnorm" % (rom, rom)
+    return ""
+
+
+def event_devices():
+    fds = []
+    for path in glob.glob("/dev/input/event*"):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            fds.append(fd)
+        except OSError:
+            pass
+    return fds
+
+
+def read_event(fd):
+    fmt = "llHHI"
+    size = struct.calcsize(fmt)
+    try:
+        data = os.read(fd, size)
+    except BlockingIOError:
+        return None
+    if len(data) != size:
+        return None
+    _, _, etype, code, value = struct.unpack(fmt, data)
+    if etype == 1:
+        if code in (103, 544):
+            if value in (1, 2):
+                return "up"
+            if value == 0:
+                return "up_release"
+        if code in (108, 545):
+            if value in (1, 2):
+                return "down"
+            if value == 0:
+                return "down_release"
+        if code in (304, 305, 315) and value == 1:
+            return "select"
+        if code in (1, 14, 314) and value == 1:
+            return "back"
+    if etype == 3 and code == 17:
+        if value == -1:
+            return "up"
+        if value == 1:
+            return "down"
+        if value == 0:
+            return "axis_release"
+    return None
+
+
+def read_keyboard(fd):
+    try:
+        data = os.read(fd, 16)
+    except BlockingIOError:
+        return None
+    if not data:
+        return None
+    if data in (b"\r", b"\n"):
+        return "select"
+    if data in (b"q", b"Q", b"\x1b", b"\x7f"):
+        return "back"
+    if data.endswith(b"[A") or data in (b"k", b"K"):
+        return "up_key"
+    if data.endswith(b"[B") or data in (b"j", b"J"):
+        return "down_key"
+    return None
+
+
+def clear_line(text=""):
+    return text[:WIDTH] + "\033[K"
+
+
+def draw(out, items, selected, top, message=""):
+    total_games = len([x for x in items if x["kind"] == "game"])
+    lines = [
+        HOME + HIDE + GREEN + "K36:/games" + RESET + DIM + "  %s installed" % total_games + RESET,
+        DIM + "-" * 54 + RESET,
+    ]
+    for idx in range(top, min(len(items), top + ROWS)):
+        item = items[idx]
+        marker = ">" if idx == selected else " "
+        text = "%s [%s] %s" % (marker, item["label"], item["name"])
+        text = text[:60]
+        if idx == selected:
+            lines.append(GREEN + INV + text.ljust(60) + RESET)
+        else:
+            lines.append(GREEN + text + RESET)
+    while len(lines) < ROWS + 2:
+        lines.append("")
+    lines.append(DIM + "-" * 54 + RESET)
+    lines.append(DIM + "dpad: scroll/hold   A: launch   select: back" + RESET)
+    lines.append(GREEN + message[:60] + RESET if message else "")
+    os.write(out, ("\n".join(clear_line(line) for line in lines) + "\n").encode())
+
+
+def launch(item, out):
+    if item["kind"] == "action":
+        if item["action"] == "stock":
+            subprocess.call("/usr/bin/emulationstation/emulationstation.sh", shell=True, executable="/bin/bash")
+        elif item["action"] == "reboot":
+            subprocess.call("sudo reboot", shell=True)
+        elif item["action"] == "poweroff":
+            subprocess.call("sudo shutdown now", shell=True)
+        return
+    os.write(out, (CLEAR + GREEN + "launching: %s\n\n" % item["name"] + RESET).encode())
+    subprocess.call(launch_command(item), shell=True, executable="/bin/bash")
+
+
+def update_window(selected, top):
+    if selected < top:
+        return selected
+    if selected >= top + ROWS:
+        return selected - ROWS + 1
+    return top
+
+
+def move_selection(selected, items, direction):
+    if direction == "up":
+        return (selected - 1) % len(items)
+    return (selected + 1) % len(items)
+
+
+def main():
+    if "--list" in sys.argv:
+        for item in scan_games():
+            print("[%s] %s" % (item["label"], item["name"]))
+        return 0
+    mount_roms()
+    fd = os.open(TTY, os.O_RDWR | os.O_NONBLOCK)
+    old = None
+    try:
+        old = termios.tcgetattr(fd)
+        new = old[:]
+        new[3] = new[3] & ~(termios.ICANON | termios.ECHO)
+        termios.tcsetattr(fd, termios.TCSANOW, new)
+    except Exception:
+        pass
+    inputs = event_devices()
+    selected = 0
+    top = 0
+    held = None
+    repeat_at = 0
+    repeat_delay = 0.32
+    repeat_rate = 0.075
+    message = "ready"
+    items = scan_games()
+    dirty = True
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        os.write(fd, (CLEAR + HIDE).encode())
+        while True:
+            if selected >= len(items):
+                selected = max(0, len(items) - 1)
+            top = update_window(selected, top)
+            if dirty:
+                draw(fd, items, selected, top, message)
+                dirty = False
+            timeout = max(0.01, min(0.08, repeat_at - time.monotonic())) if held else 0.08
+            readable, _, _ = select.select([fd] + inputs, [], [], timeout)
+            now = time.monotonic()
+            action = None
+            for src in readable:
+                if src == fd:
+                    action = read_keyboard(fd) or action
+                else:
+                    action = read_event(src) or action
+            if action in ("up", "down"):
+                selected = move_selection(selected, items, action)
+                held = action
+                repeat_at = now + repeat_delay
+                dirty = True
+            elif action in ("up_key", "down_key"):
+                selected = move_selection(selected, items, action.replace("_key", ""))
+                dirty = True
+            elif action == "up_release" and held == "up":
+                held = None
+            elif action == "down_release" and held == "down":
+                held = None
+            elif action == "axis_release":
+                held = None
+            elif action == "select":
+                launch(items[selected], fd)
+                items = scan_games()
+                os.write(fd, (CLEAR + HIDE).encode())
+                message = "returned"
+                held = None
+                dirty = True
+            elif action == "back":
+                message = "still here"
+                held = None
+                dirty = True
+            elif held and now >= repeat_at:
+                selected = move_selection(selected, items, held)
+                repeat_at = now + repeat_rate
+                dirty = True
+    finally:
+        if old:
+            termios.tcsetattr(fd, termios.TCSANOW, old)
+        os.write(fd, (SHOW + RESET).encode())
+        for dev in inputs:
+            try:
+                os.close(dev)
+            except OSError:
+                pass
+        os.close(fd)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
