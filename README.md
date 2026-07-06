@@ -11,7 +11,7 @@ This is not a new OS image. It is a small replacement for the default EmulationS
 - Launches games through the existing ArkOS wrappers.
 - Keeps stock EmulationStation available from the menu.
 - Supports D-pad scrolling, held-button repeat, and A-button launch.
-- Watches for Select+Start while a game is running and returns to the terminal menu.
+- Watches for Select+Start while a game is running, lets the app exit normally, then restores tty1 and repaints the terminal menu.
 - Avoids constant full-screen redraws to reduce terminal flicker.
 - Repaints briefly after boot so late verbose boot output does not cover the menu.
 
@@ -45,6 +45,14 @@ sudo reboot
 ```
 
 You can also choose `Stock EmulationStation` from the terminal launcher menu without uninstalling.
+
+## Controls
+
+- D-pad: move selection
+- Hold D-pad: repeat scroll
+- A: launch selected game
+- Select+Start while in a game: return to launcher
+- Hold Select+Start if the app does not exit on its own
 
 ## Development
 

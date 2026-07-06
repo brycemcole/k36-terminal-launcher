@@ -26,6 +26,8 @@ The launcher reads `/dev/input/event*` directly and currently handles common D-p
 - Back/cancel: `1`, `14`
 - Home combo: `314` plus `315`
 
+The launcher waits for the app or emulator wrapper to exit normally after the home combo. If the combo remains held for a short timeout, it sends a termination signal, restores tty1 to text mode, drains stale button events, and repaints the menu.
+
 If your device boots but controls do not move the menu, open an issue with your device model and `evtest` output.
 
 ## Safety

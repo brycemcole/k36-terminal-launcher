@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import glob
+import fcntl
 import os
 import select
 import shlex
@@ -28,6 +29,10 @@ BOOT_REDRAW_INTERVAL = 0.5
 SELECT_CODES = (314,)
 START_CODES = (315,)
 CONFIRM_CODES = (304, 305)
+HOME_FORCE_SECONDS = 1.4
+RETURN_INPUT_LOCK_SECONDS = 0.75
+KDSETMODE = 0x4B3A
+KD_TEXT = 0
 
 
 def run_silent(cmd):
@@ -47,6 +52,37 @@ def mount_roms():
             run_silent("sudo mount %s /roms" % shlex.quote(part))
     elif os.path.exists("/dev/mmcblk1p3"):
         run_silent("sudo mount /dev/mmcblk1p3 /roms")
+
+
+def configure_terminal(fd):
+    try:
+        fcntl.ioctl(fd, KDSETMODE, KD_TEXT)
+    except OSError:
+        pass
+    try:
+        new = termios.tcgetattr(fd)
+        new[3] = new[3] & ~(termios.ICANON | termios.ECHO)
+        termios.tcsetattr(fd, termios.TCSANOW, new)
+    except Exception:
+        pass
+    run_silent("sudo chvt 1")
+    run_silent("sudo /bin/plymouth hide-splash")
+    run_silent("sudo setfont /usr/share/consolefonts/Lat7-Terminus20x10.psf.gz")
+    run_silent("sudo sh -c 'printf \"\\033c\\033[?25l\" > /dev/tty1'")
+
+
+def drain_inputs(inputs, seconds=0.35):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        readable, _, _ = select.select(inputs, [], [], 0.02)
+        for fd in readable:
+            while True:
+                try:
+                    data = os.read(fd, 4096)
+                except BlockingIOError:
+                    break
+                if not data:
+                    break
 
 
 def clean_name(path):
@@ -275,15 +311,21 @@ def run_game_command(cmd, out, inputs, item):
     draw_launch(out, item, "starting launcher handoff...")
     proc = subprocess.Popen(cmd, shell=True, executable="/bin/bash", preexec_fn=os.setsid)
     buttons = set()
-    home_requested = False
+    home_since = None
+    forced_home = False
     while proc.poll() is None:
         readable, _, _ = select.select(inputs, [], [], 0.08)
         for src in readable:
             action = read_event(src)
             if update_buttons(buttons, action):
-                home_requested = True
-        if home_requested:
-            draw_launch(out, item, "home requested; stopping game...")
+                if home_since is None:
+                    home_since = time.monotonic()
+                    draw_launch(out, item, "home requested; waiting for app exit...")
+            elif action in ("select_up", "start_up"):
+                home_since = None
+        if home_since is not None and time.monotonic() - home_since >= HOME_FORCE_SECONDS:
+            draw_launch(out, item, "home held; stopping app...")
+            forced_home = True
             try:
                 os.killpg(proc.pid, signal.SIGTERM)
                 proc.wait(timeout=3)
@@ -293,7 +335,9 @@ def run_game_command(cmd, out, inputs, item):
             break
     run_silent("sudo perfnorm")
     run_silent("sudo systemctl restart oga_events")
-    return home_requested
+    configure_terminal(out)
+    drain_inputs(inputs, RETURN_INPUT_LOCK_SECONDS)
+    return forced_home
 
 
 def launch(item, out, inputs):
@@ -342,6 +386,7 @@ def main():
     top = 0
     held = None
     buttons = set()
+    input_block_until = 0
     repeat_at = 0
     repeat_delay = 0.32
     repeat_rate = 0.075
@@ -373,6 +418,8 @@ def main():
                     action = read_keyboard(fd) or action
                 else:
                     action = read_event(src) or action
+            if action and time.monotonic() < input_block_until:
+                continue
             if action in ("up", "down"):
                 selected = move_selection(selected, items, action)
                 held = action
@@ -399,7 +446,8 @@ def main():
                 message = "returned"
                 held = None
                 buttons.clear()
-                boot_redraw_until = time.monotonic() + 1.0
+                input_block_until = time.monotonic() + RETURN_INPUT_LOCK_SECONDS
+                boot_redraw_until = time.monotonic() + 2.5
                 next_boot_redraw = 0
                 dirty = True
             elif action == "back":
