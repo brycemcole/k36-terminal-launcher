@@ -10,8 +10,10 @@ This is not a new OS image. It is a small replacement for the default EmulationS
 - Scans installed games from `/roms/gba`, `/roms/nds`, `/roms/pico-8/carts`, and `/roms/ports`.
 - Launches games through the existing ArkOS wrappers.
 - Keeps stock EmulationStation available from the menu.
-- Supports D-pad scrolling, held-button repeat, and A/select launch.
+- Supports D-pad scrolling, held-button repeat, and A-button launch.
+- Watches for Select+Start while a game is running and returns to the terminal menu.
 - Avoids constant full-screen redraws to reduce terminal flicker.
+- Repaints briefly after boot so late verbose boot output does not cover the menu.
 
 ## Status
 

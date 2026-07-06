@@ -22,8 +22,9 @@ The launcher reads `/dev/input/event*` directly and currently handles common D-p
 
 - Up: `103`, `544`, or absolute hat `17 = -1`
 - Down: `108`, `545`, or absolute hat `17 = 1`
-- Select/launch: `304`, `305`, `315`
-- Back: `1`, `14`, `314`
+- Launch: `304`, `305`
+- Back/cancel: `1`, `14`
+- Home combo: `314` plus `315`
 
 If your device boots but controls do not move the menu, open an issue with your device model and `evtest` output.
 

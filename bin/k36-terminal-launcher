@@ -23,6 +23,11 @@ HIDE = "\033[?25l"
 SHOW = "\033[?25h"
 WIDTH = 66
 ROWS = 17
+BOOT_REDRAW_SECONDS = 8.0
+BOOT_REDRAW_INTERVAL = 0.5
+SELECT_CODES = (314,)
+START_CODES = (315,)
+CONFIRM_CODES = (304, 305)
 
 
 def run_silent(cmd):
@@ -151,9 +156,19 @@ def read_event(fd):
                 return "down"
             if value == 0:
                 return "down_release"
-        if code in (304, 305, 315) and value == 1:
-            return "select"
-        if code in (1, 14, 314) and value == 1:
+        if code in CONFIRM_CODES and value == 1:
+            return "confirm"
+        if code in SELECT_CODES:
+            if value == 1:
+                return "select_down"
+            if value == 0:
+                return "select_up"
+        if code in START_CODES:
+            if value == 1:
+                return "start_down"
+            if value == 0:
+                return "start_up"
+        if code in (1, 14) and value == 1:
             return "back"
     if etype == 3 and code == 17:
         if value == -1:
@@ -173,7 +188,7 @@ def read_keyboard(fd):
     if not data:
         return None
     if data in (b"\r", b"\n"):
-        return "select"
+        return "confirm"
     if data in (b"q", b"Q", b"\x1b", b"\x7f"):
         return "back"
     if data.endswith(b"[A") or data in (b"k", b"K"):
@@ -217,7 +232,7 @@ def draw(out, items, selected, top, message=""):
     while len(lines) < list_rows + 2:
         lines.append("")
     lines.append(DIM + "-" * 54 + RESET)
-    lines.append(DIM + "dpad: scroll/hold   A: launch   select: back" + RESET)
+    lines.append(DIM + "dpad: scroll/hold   A: launch   Select+Start: home" + RESET)
     lines.append(GREEN + message[:content_width] + RESET if message else "")
     while len(lines) < screen_rows:
         lines.append("")
@@ -225,7 +240,63 @@ def draw(out, items, selected, top, message=""):
     os.write(out, frame.encode())
 
 
-def launch(item, out):
+def draw_launch(out, item, message):
+    screen_rows, screen_cols = screen_size(out)
+    content_width = max(20, min(WIDTH, screen_cols - 1))
+    lines = [
+        GREEN + "K36:/launch" + RESET,
+        DIM + "-" * 54 + RESET,
+        GREEN + ("target: %s" % item["name"])[:content_width] + RESET,
+        GREEN + ("system: %s" % item["label"])[:content_width] + RESET,
+        DIM + ("rom: %s" % item.get("path", ""))[:content_width] + RESET,
+        "",
+        GREEN + message[:content_width] + RESET,
+        DIM + "Select+Start: return home" + RESET,
+    ]
+    while len(lines) < screen_rows:
+        lines.append("")
+    frame = CLEAR + HIDE + "".join("\033[%s;1H%s\033[K" % (row, line) for row, line in enumerate(lines[:screen_rows], 1))
+    os.write(out, frame.encode())
+
+
+def update_buttons(buttons, action):
+    if action == "select_down":
+        buttons.add("select")
+    elif action == "select_up":
+        buttons.discard("select")
+    elif action == "start_down":
+        buttons.add("start")
+    elif action == "start_up":
+        buttons.discard("start")
+    return "select" in buttons and "start" in buttons
+
+
+def run_game_command(cmd, out, inputs, item):
+    draw_launch(out, item, "starting launcher handoff...")
+    proc = subprocess.Popen(cmd, shell=True, executable="/bin/bash", preexec_fn=os.setsid)
+    buttons = set()
+    home_requested = False
+    while proc.poll() is None:
+        readable, _, _ = select.select(inputs, [], [], 0.08)
+        for src in readable:
+            action = read_event(src)
+            if update_buttons(buttons, action):
+                home_requested = True
+        if home_requested:
+            draw_launch(out, item, "home requested; stopping game...")
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=2)
+            break
+    run_silent("sudo perfnorm")
+    run_silent("sudo systemctl restart oga_events")
+    return home_requested
+
+
+def launch(item, out, inputs):
     if item["kind"] == "action":
         if item["action"] == "stock":
             subprocess.call("/usr/bin/emulationstation/emulationstation.sh", shell=True, executable="/bin/bash")
@@ -234,8 +305,7 @@ def launch(item, out):
         elif item["action"] == "poweroff":
             subprocess.call("sudo shutdown now", shell=True)
         return
-    os.write(out, (CLEAR + GREEN + "launching: %s\n\n" % item["name"] + RESET).encode())
-    subprocess.call(launch_command(item), shell=True, executable="/bin/bash")
+    return run_game_command(launch_command(item), out, inputs, item)
 
 
 def update_window(selected, top, list_rows):
@@ -271,26 +341,32 @@ def main():
     selected = 0
     top = 0
     held = None
+    buttons = set()
     repeat_at = 0
     repeat_delay = 0.32
     repeat_rate = 0.075
     message = "ready"
     items = scan_games()
     dirty = True
+    boot_redraw_until = time.monotonic() + BOOT_REDRAW_SECONDS
+    next_boot_redraw = 0
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
         os.write(fd, (CLEAR + HIDE).encode())
         while True:
+            now = time.monotonic()
             if selected >= len(items):
                 selected = max(0, len(items) - 1)
             list_rows = visible_rows(fd)
             top = update_window(selected, top, list_rows)
+            if now < boot_redraw_until and now >= next_boot_redraw:
+                dirty = True
+                next_boot_redraw = now + BOOT_REDRAW_INTERVAL
             if dirty:
                 draw(fd, items, selected, top, message)
                 dirty = False
             timeout = max(0.01, min(0.08, repeat_at - time.monotonic())) if held else 0.08
             readable, _, _ = select.select([fd] + inputs, [], [], timeout)
-            now = time.monotonic()
             action = None
             for src in readable:
                 if src == fd:
@@ -311,12 +387,20 @@ def main():
                 held = None
             elif action == "axis_release":
                 held = None
-            elif action == "select":
-                launch(items[selected], fd)
+            elif action in ("select_down", "select_up", "start_down", "start_up"):
+                if update_buttons(buttons, action):
+                    message = "home"
+                    held = None
+                    dirty = True
+            elif action == "confirm":
+                launch(items[selected], fd, inputs)
                 items = scan_games()
                 os.write(fd, (CLEAR + HIDE).encode())
                 message = "returned"
                 held = None
+                buttons.clear()
+                boot_redraw_until = time.monotonic() + 1.0
+                next_boot_redraw = 0
                 dirty = True
             elif action == "back":
                 message = "still here"
